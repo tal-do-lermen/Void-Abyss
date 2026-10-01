@@ -1,4 +1,4 @@
-# Arquitetura Revisada — Gerenciador Universal de Pacotes
+# Arquitetura Revisada — Abyss: Gerenciador Universal de Pacotes
 
 ## 1. Objetivo
 
@@ -7,7 +7,7 @@ O projeto não deve ser um gerenciador ligado ao Void Linux, XBPS, AUR ou qualqu
 Ele deve ser um **gerenciador universal de receitas, build e pacotes**, com:
 
 - núcleo independente de distribuição;
-- formato binário próprio;
+- formato de pacote binário `.abyss`;
 - importação de receitas Git, AUR, Void e Gentoo;
 - build local usando as ferramentas nativas do projeto;
 - instalação e atualização controladas pelo próprio gerenciador;
@@ -66,7 +66,7 @@ Git / AUR / Void / Gentoo / URL
        │                 │
        └────────┬────────┘
                 ▼
-             *.pkgx
+             *.abyss
                 │
                 ▼
        Package Database
@@ -209,7 +209,7 @@ build → package → install → cleanup
 │                                                             │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│                  Package Format (*.pkgx)                     │
+│                Abyss Package Format (*.abyss)                     │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -446,7 +446,7 @@ URL ──────┘
            ↓
       Build Engine
            ↓
-      Package *.pkgx
+      Pacote *.abyss
 ```
 
 Isso reduz drasticamente a complexidade do projeto.
@@ -496,7 +496,7 @@ O build deve usar um único workspace por tarefa:
 
 ```text
 /tmp ou /var/tmp
-└── pkgmgr/
+└── abyss/
     └── build-<id>/
         ├── source/
         ├── build/
@@ -525,46 +525,169 @@ A escolha não deve ser obrigatória pelo projeto.
 
 ---
 
-# 10. Package Format próprio
+# 10. Abyss Package Format (*.abyss)
 
-O gerenciador deve gerar seu próprio formato:
+O Abyss utiliza um formato binário próprio para representar o pacote instalável:
 
 ```text
-foo-1.2.3-x86_64.pkgx
+foo-1.2.3-x86_64.abyss
 ```
+
+O arquivo `.abyss` é um contêiner de pacote e não deve ser apenas um `tar.zst` renomeado. Ele possui metadados estruturados, manifest, informações de integridade/assinatura e um payload comprimido.
+
+## 10.1 Estrutura conceitual
+
+```text
+┌────────────────────────────────────────────┐
+│ Header ABYS                                │
+│ versão / flags / offsets / tamanhos        │
+├────────────────────────────────────────────┤
+│ Metadata                                   │
+│ identidade / versão / ABI / dependências   │
+├────────────────────────────────────────────┤
+│ Manifest                                   │
+│ arquivos / permissões / checksums          │
+├────────────────────────────────────────────┤
+│ Signature / integridade                    │
+├────────────────────────────────────────────┤
+│ Payload                                    │
+│ tar + zstd                                 │
+└────────────────────────────────────────────┘
+```
+
+## 10.2 Header
+
+O header deve permitir que o Abyss identifique e inspecione o pacote sem descompactar o payload.
 
 Estrutura conceitual:
 
 ```text
-PKGX
-├── header
-├── metadata
-├── manifest
-├── dependency information
-├── optional signature
-└── compressed payload
+magic             4 bytes   "ABYS"
+format_version    2 bytes
+flags             2 bytes
+metadata_offset   u64
+metadata_size     u64
+manifest_offset   u64
+manifest_size     u64
+payload_offset    u64
+payload_size      u64
 ```
 
-Payload:
+O formato deve definir explicitamente:
 
 ```text
-tar + zstd
+endianness
+alinhamento
+versão do formato
+flags reservadas
 ```
 
-O pacote pode ser um único arquivo.
+As estruturas binárias devem permitir evolução futura sem quebrar leitores antigos de forma silenciosa.
 
-Não criar:
+## 10.3 Metadata
+
+Os metadados podem ser serializados em um formato compacto e estruturado, preferencialmente CBOR.
+
+Exemplo conceitual:
 
 ```text
-foo/
-foo-build/
-foo-files/
-foo-metadata/
+name = foo
+version = 1.2.3
+epoch = 0
+architecture = x86_64
+abi = linux-x86_64-glibc
+fingerprint = sha256:...
 ```
 
-como estruturas permanentes.
+O metadata do `.abyss` deve conter somente o necessário para identificar, validar e instalar o pacote.
 
----
+## 10.4 Manifest
+
+O manifest registra os arquivos que o pacote instala:
+
+```text
+/usr/bin/foo
+/usr/lib/libfoo.so
+/usr/share/man/man1/foo.1
+```
+
+Cada entrada deve poder registrar, quando aplicável:
+
+```text
+path
+type
+mode
+uid
+gid
+size
+checksum
+```
+
+O manifest é utilizado para:
+
+```text
+remoção
+verificação de integridade
+upgrade
+checagem de conflitos de arquivos
+```
+
+## 10.5 Payload
+
+O payload contém os arquivos reais do pacote em `tar + zstd`:
+
+```text
+payload.tar.zst
+```
+
+Exemplo:
+
+```text
+usr/
+├── bin/
+│   └── foo
+├── lib/
+│   └── libfoo.so
+└── share/
+    └── ...
+```
+
+O gerador deve fazer streaming de `pkgroot -> tar -> zstd -> .abyss`, evitando carregar o pacote inteiro na RAM.
+
+## 10.6 Leitura sem extração
+
+Graças aos offsets do header, comandos como:
+
+```bash
+abyss inspect foo.abyss
+abyss list foo.abyss
+```
+
+podem ler metadata e manifest sem extrair o payload.
+
+## 10.7 Pacote final e workspace
+
+Durante o build:
+
+```text
+source/
+build/
+pkgroot/
+```
+
+Após a geração:
+
+```text
+pkgroot/
+   ↓
+manifest + metadata
+   ↓
+foo-1.2.3-x86_64.abyss
+   ↓
+cleanup do workspace
+```
+
+O `.abyss` é o artefato final distribuível/instalável.
 
 # 11. Metadata mínima
 
@@ -669,44 +792,162 @@ O PackageSpec continua igual.
 
 # 14. Dependências
 
-Separar:
+O Abyss deve separar três conceitos diferentes:
 
 ```text
-package dependencies
+1. dependência declarada
+2. dependência resolvida
+3. dependência instalada
 ```
 
-de:
+## 14.1 Dependência declarada
 
-```text
-host capabilities
-```
-
-Exemplo:
+O `PackageSpec` descreve as restrições definidas pela receita:
 
 ```text
 foo
- ├── depends: bar
- ├── depends: libpng
- └── requires: libc
+ ├── runtime: bar >= 2.0
+ ├── runtime: libpng >= 1.6,<2.0
+ ├── optional: ffmpeg
+ └── build: cmake >= 3.28
 ```
 
-`bar` pode ser um pacote administrado pelo projeto.
+A restrição deve preservar operador e versão, e não somente o nome do pacote.
 
-`libc` pode ser uma capacidade fornecida pelo sistema.
-
-O resolver deve primeiro verificar:
+Tipos mínimos:
 
 ```text
-pacote próprio
-        ↓
-pacote instalado
-        ↓
-capacidade do host
+runtime
+build
+check
+optional
 ```
 
-e somente depois decidir se é necessário instalar/buildar alguma dependência.
+## 14.2 Dependência resolvida
 
----
+Após o resolver, a restrição abstrata é associada a um artefato concreto:
+
+```text
+foo 1.5
+ ├── bar 2.4.1
+ └── libpng 1.6.50
+```
+
+O Abyss não deve armazenar uma cópia completa da árvore de dependências dentro de cada pacote. Deve armazenar as relações diretas:
+
+```text
+foo  → bar
+foo  → libpng
+bar  → zlib
+```
+
+O grafo completo é reconstruído pelo resolver quando necessário.
+
+## 14.3 Dependência instalada
+
+O estado local registra qual build realmente foi instalado e qual build resolveu cada aresta:
+
+```text
+foo-1.5.0 fingerprint ABC
+    ↓
+bar-2.4.1 fingerprint DEF
+```
+
+Isso é diferente de registrar somente `bar >= 2.0`.
+
+## 14.4 Provides / capabilities
+
+Dependências não devem obrigatoriamente apontar para um nome de pacote. O pacote pode fornecer capacidades:
+
+```text
+mesa   → provides: libGL
+nvidia → provides: libGL
+```
+
+O resolver deve conseguir resolver:
+
+```text
+foo
+ ↓
+requires: libGL
+ ↓
+capability provider
+```
+
+O mesmo mecanismo pode ser utilizado para capacidades do host, por exemplo:
+
+```text
+libc
+libGL.so.1
+/usr/bin/python3
+```
+
+A separação entre pacote e capacidade do host deve ser preservada.
+
+## 14.5 Dependency groups
+
+O modelo deve suportar alternativas (`OR`) por meio de grupos de dependência:
+
+```text
+(libcurl OR wget)
+(gcc OR clang)
+```
+
+Internamente:
+
+```text
+group_id = 10
+ ├── libcurl
+ └── wget
+```
+
+Isso evita criar regras especiais no resolver para cada tipo de alternativa.
+
+## 14.6 Reverse dependencies
+
+As relações instaladas devem ser navegáveis nos dois sentidos:
+
+```text
+foo → bar
+app → bar
+```
+
+Assim, ao remover `foo`, o Abyss pode detectar que `bar` ainda é usado por `app`.
+
+Se `bar` não possuir nenhum consumidor restante, ele pode ser considerado órfão.
+
+## 14.7 Build dependencies não são runtime dependencies
+
+Dependências utilizadas somente para compilar o pacote não devem ser tratadas como dependências de execução:
+
+```text
+foo
+ ├── runtime → openssl
+ ├── runtime → zlib
+ └── build   → cmake
+                → ninja
+                → clang
+```
+
+Isso permite remover posteriormente apenas dependências de build que não sejam mais utilizadas.
+
+## 14.8 Ordem de resolução
+
+O resolver deve consultar nesta ordem:
+
+```text
+dependência declarada
+        ↓
+pacote Abyss instalado
+        ↓
+capacidade fornecida por outro pacote
+        ↓
+capacidade do host
+        ↓
+resolver build/instalação necessária
+```
+
+O objetivo é evitar instalar ou reconstruir uma dependência que já esteja satisfeita pelo sistema ou por outro pacote.
 
 # 15. Build fingerprint
 
@@ -746,16 +987,16 @@ O fingerprint não implica manter o build inteiro no disco.
 A separação deve seguir o padrão XDG:
 
 ```text
-~/.config/pkgmgr/
+~/.config/abyss/
 └── config.toml
 
-~/.local/state/pkgmgr/
+~/.local/state/abyss/
 ├── state.db
 ├── packages/
 │   └── <nome>.toml
 └── logs/
 
-~/.cache/pkgmgr/
+~/.cache/abyss/
 └── cache/
 ```
 
@@ -840,40 +1081,164 @@ o workspace deve ser removido, preservando apenas o que estiver dentro do cache 
 
 # 17. Banco de dados
 
-Usar uma única base pequena:
+Usar uma única base pequena em SQLite:
 
 ```text
 state.db
 ```
 
-Guardar apenas:
+O banco representa o **estado da máquina**, e não o conteúdo completo dos pacotes.
+
+## 17.1 Tabelas principais
+
+### packages
+
+Identidade lógica do pacote:
 
 ```text
-package
-version
-source
+packages
+├── id
+└── name
+```
+
+### package_builds
+
+Representa uma versão/artefato concreto:
+
+```text
+package_builds
+├── id
+├── package_id
+├── version
+├── epoch
+├── architecture
+├── abi
+├── fingerprint
+└── checksum
+```
+
+Um mesmo pacote pode possuir múltiplos builds para ABI, arquitetura ou fingerprint diferentes.
+
+### dependencies
+
+Guarda as dependências declaradas de cada build:
+
+```text
+dependencies
+├── package_build_id
+├── type
+├── name
+├── operator
+├── version
+└── group_id
+```
+
+Exemplo:
+
+```text
+foo 1.5
+ ├── runtime | bar    | >= | 2.0
+ ├── runtime | libpng | >= | 1.6
+ └── build   | cmake  | >= | 3.28
+```
+
+### provides
+
+Registra capacidades fornecidas por um build:
+
+```text
+provides
+├── package_build_id
+├── capability
+└── version
+```
+
+### installed_packages
+
+Registra os builds realmente instalados:
+
+```text
+installed_packages
+├── id
+├── package_build_id
+└── installed_at
+```
+
+### installed_dependencies
+
+Representa o grafo efetivamente resolvido na máquina:
+
+```text
+installed_dependencies
+├── parent_install_id
+└── child_install_id
+```
+
+Exemplo:
+
+```text
+foo-1.5 (ABC)
+   ↓
+bar-2.4.1 (DEF)
+   ↓
+zlib-1.3.1 (GHI)
+```
+
+Esse modelo evita armazenar a árvore completa repetidamente.
+
+## 17.2 O que o state.db guarda
+
+```text
+package identity
+package version
+recipe/source reference
 recipe revision
-installed version
+installed build
 build fingerprint
 ABI
+dependency edges
+provides
 status
 timestamps
 ```
 
-Não armazenar:
+Não armazenar no banco:
 
 ```text
 source contents
 Git objects
-build logs completos
-package payload
+build directory
+payload completo
+logs completos
 ```
 
-Para minimizar arquivos auxiliares, evitar WAL persistente por padrão.
+O pacote `.abyss` continua sendo a fonte do manifest e dos metadados do artefato quando estiver disponível.
 
-Logs detalhados devem ser temporários ou limitados a um tamanho pequeno.
+## 17.3 Remoção e órfãos
 
----
+Para remover `foo`:
+
+```text
+foo
+ ↓
+consultar installed_dependencies
+ ↓
+remover foo
+ ↓
+verificar consumidores de cada dependência
+ ↓
+manter dependências ainda usadas
+ ↓
+marcar/remover órfãs conforme política
+```
+
+O modelo permite implementar futuramente:
+
+```text
+abyss autoremove
+```
+
+sem precisar reconstruir a árvore a partir de todos os pacotes instalados.
 
 # 18. Estratégia de cache
 
@@ -1002,7 +1367,7 @@ quando um pacote tiver múltiplas fontes.
 Comando:
 
 ```text
-pkgmgr check foo
+abyss check foo
 ```
 
 deve trabalhar somente com:
@@ -1112,7 +1477,7 @@ build
    ↓
 pkgroot
    ↓
-.pkgx
+.abyss
 ```
 
 Nenhuma etapa de compilação deve precisar de:
@@ -1148,16 +1513,16 @@ normalmente exige privilégio.
 Por isso o projeto deve separar:
 
 ```text
-pkgmgr
+abyss
 ```
 
 de:
 
 ```text
-pkgmgr-helper
+abyss-helper
 ```
 
-### `pkgmgr`
+### `abyss`
 
 Processo normal, sem privilégios:
 
@@ -1170,7 +1535,7 @@ package
 verification
 ```
 
-### `pkgmgr-helper`
+### `abyss-helper`
 
 Componente mínimo e privilegiado, acionado somente quando uma operação realmente exige acesso ao sistema.
 
@@ -1196,7 +1561,7 @@ update package database
 Antes da instalação:
 
 ```text
-.pkgx
+.abyss
   ↓
 verificar assinatura
   ↓
@@ -1220,7 +1585,7 @@ O componente privilegiado deve operar sobre o artefato já construído e validad
 A autorização deve ser feita por um mecanismo apropriado ao host, sem exigir:
 
 ```text
-sudo pkgmgr ...
+sudo abyss ...
 ```
 
 Quando houver suporte no sistema, pode ser utilizada uma camada de autorização como PolicyKit/polkit.
@@ -1247,7 +1612,7 @@ $HOME/.local/share
 Nesse modo:
 
 ```text
-pkgmgr install foo --user
+abyss install foo --user
 ```
 
 não exige helper.
@@ -1260,7 +1625,7 @@ não exige helper.
                     usuário normal
                          │
                          ▼
-                    pkgmgr CLI
+                    abyss CLI
                          │
           ┌──────────────┼──────────────┐
           │              │              │
@@ -1269,7 +1634,7 @@ não exige helper.
           └──────────────┼──────────────┘
                          │
                          ▼
-                       .pkgx
+                       .abyss
                          │
                     verificação
                          │
@@ -1282,13 +1647,13 @@ não exige helper.
               instalar      autorização
               como user          │
                                  ▼
-                           pkgmgr-helper
+                           abyss-helper
                                  │
                                  ▼
                          instalar/remover
 ```
 
-O `pkgmgr` principal nunca deve ser reiniciado como root para concluir a operação.
+O `abyss` principal nunca deve ser reiniciado como root para concluir a operação.
 
 ---
 
@@ -1311,14 +1676,14 @@ precisa acesso sistêmico?
     │
    ├── não → remover como usuário
    │
-   └── sim → pkgmgr-helper
+   └── sim → abyss-helper
                  ↓
             remover arquivos
                  ↓
             atualizar state.db
 ```
 
-O `pkgmgr` nunca executa a remoção diretamente como `root`.
+O `abyss` nunca executa a remoção diretamente como `root`.
 
 Não é necessário manter uma cópia do pacote para saber o que foi instalado.
 
@@ -1385,7 +1750,7 @@ O adapter decide como realizar isso no host.
 # 24. Estrutura final do projeto
 
 ```text
-pkgmgr/
+abyss/
 ├── core/
 │   ├── package-spec
 │   ├── dependency-resolver
@@ -1432,7 +1797,7 @@ pkgmgr/
 # 25. Fluxo completo
 
 ```text
-pkgmgr add <source>
+abyss add <source>
         │
         ▼
 detect source
@@ -1453,7 +1818,7 @@ state.db
 Atualização:
 
 ```text
-pkgmgr update foo
+abyss update foo
         │
         ▼
 consulta metadata
@@ -1494,7 +1859,7 @@ compilar
 manifest
      │
      ▼
-*.pkgx
+*.abyss
      │
      ▼
 install
@@ -1508,27 +1873,27 @@ cleanup
 # 26. Interface
 
 ```text
-pkgmgr add <git-url>
-pkgmgr import <aur|void|gentoo|file>
-pkgmgr inspect <package>
-pkgmgr check <package>
-pkgmgr update <package>
-pkgmgr build <package>
-pkgmgr install <package>
-pkgmgr remove <package>
-pkgmgr upgrade
-pkgmgr search <query>
-pkgmgr list
-pkgmgr info <package>
+abyss add <git-url>
+abyss import <aur|void|gentoo|file>
+abyss inspect <package>
+abyss check <package>
+abyss update <package>
+abyss build <package>
+abyss install <package>
+abyss remove <package>
+abyss upgrade
+abyss search <query>
+abyss list
+abyss info <package>
 ```
 
 Operações relacionadas a armazenamento:
 
 ```text
-pkgmgr cache status
-pkgmgr cache clean
-pkgmgr cache disable
-pkgmgr package keep
+abyss cache status
+abyss cache clean
+abyss cache disable
+abyss package keep
 ```
 
 ---
@@ -1553,13 +1918,13 @@ privileged helper mínimo
 Objetivo:
 
 ```text
-Git → PackageSpec → build → .pkgx → install
+Git → PackageSpec → build → .abyss → install
 ```
 
 Regra desde a primeira versão:
 
 ```text
-pkgmgr nunca roda como root
+abyss nunca roda como root
 build nunca roda como root
 sudo não faz parte do fluxo
 ```
@@ -1638,7 +2003,7 @@ ou aumentado pelo usuário.
 Somente depois:
 
 ```text
-remote *.pkgx
+remote *.abyss
 ```
 
 Com suporte a:
@@ -1679,7 +2044,7 @@ Nunca permitir que o cache cresça indefinidamente.
 ### 3. Segurança
 
 ```text
-pkgmgr nunca roda como root
+abyss nunca roda como root
 build nunca roda como root
 sudo não faz parte do fluxo
 ```
@@ -1711,7 +2076,7 @@ Portanto:
      Build
        │
        ▼
-    *.pkgx
+    *.abyss
        │
        ▼
  Install
